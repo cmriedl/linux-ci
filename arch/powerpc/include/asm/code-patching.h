@@ -188,4 +188,8 @@ static inline unsigned long ppc_kallsyms_lookup_name(const char *name)
 				 ___PPC_RA(__REG_R1) | PPC_LR_STKOFF)
 #endif /* CONFIG_PPC64 */
 
+#if IS_BUILTIN(CONFIG_LKDTM) && IS_ENABLED(CONFIG_STRICT_KERNEL_RWX)
+unsigned long read_cpu_patching_addr(unsigned int cpu);
+#endif
+
 #endif /* _ASM_POWERPC_CODE_PATCHING_H */
