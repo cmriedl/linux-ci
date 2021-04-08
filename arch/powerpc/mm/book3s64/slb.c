@@ -441,10 +441,39 @@ static void slb_cache_slbie_user(unsigned int index)
 	asm volatile("slbie %0" : : "r" (slbie_data));
 }
 
+static void preload_slb_entries(struct task_struct *tsk, struct mm_struct *mm)
+{
+	struct thread_info *ti = task_thread_info(tsk);
+	unsigned char i;
+
+	/*
+	 * We gradually age out SLBs after a number of context switches to
+	 * reduce reload overhead of unused entries (like we do with FP/VEC
+	 * reload). Each time we wrap 256 switches, take an entry out of the
+	 * SLB preload cache.
+	 */
+	tsk->thread.load_slb++;
+	if (!tsk->thread.load_slb) {
+		unsigned long pc = KSTK_EIP(tsk);
+
+		preload_age(ti);
+		preload_add(ti, pc);
+	}
+
+	for (i = 0; i < ti->slb_preload_nr; i++) {
+		unsigned char idx;
+		unsigned long ea;
+
+		idx = (ti->slb_preload_tail + i) % SLB_PRELOAD_NR;
+		ea = (unsigned long)ti->slb_preload_esid[idx] << SID_SHIFT;
+
+		slb_allocate_user(mm, ea);
+	}
+}
+
 /* Flush all user entries from the segment table of the current processor. */
 void switch_slb(struct task_struct *tsk, struct mm_struct *mm)
 {
-	struct thread_info *ti = task_thread_info(tsk);
 	unsigned char i;
 
 	/*
@@ -502,29 +531,8 @@ void switch_slb(struct task_struct *tsk, struct mm_struct *mm)
 
 	copy_mm_to_paca(mm);
 
-	/*
-	 * We gradually age out SLBs after a number of context switches to
-	 * reduce reload overhead of unused entries (like we do with FP/VEC
-	 * reload). Each time we wrap 256 switches, take an entry out of the
-	 * SLB preload cache.
-	 */
-	tsk->thread.load_slb++;
-	if (!tsk->thread.load_slb) {
-		unsigned long pc = KSTK_EIP(tsk);
-
-		preload_age(ti);
-		preload_add(ti, pc);
-	}
-
-	for (i = 0; i < ti->slb_preload_nr; i++) {
-		unsigned char idx;
-		unsigned long ea;
-
-		idx = (ti->slb_preload_tail + i) % SLB_PRELOAD_NR;
-		ea = (unsigned long)ti->slb_preload_esid[idx] << SID_SHIFT;
-
-		slb_allocate_user(mm, ea);
-	}
+	if (!mm->context.skip_slb_preload)
+		preload_slb_entries(tsk, mm);
 
 	/*
 	 * Synchronize slbmte preloads with possible subsequent user memory

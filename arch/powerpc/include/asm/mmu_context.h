@@ -298,6 +298,19 @@ static inline int arch_dup_mmap(struct mm_struct *oldmm,
 	return 0;
 }
 
+#ifdef CONFIG_PPC_BOOK3S_64
+
+static inline void skip_slb_preload_mm(struct mm_struct *mm)
+{
+	mm->context.skip_slb_preload = true;
+}
+
+#else
+
+static inline void skip_slb_preload_mm(struct mm_struct *mm) {}
+
+#endif /* CONFIG_PPC_BOOK3S_64 */
+
 #include <asm-generic/mmu_context.h>
 
 #endif /* __KERNEL__ */
