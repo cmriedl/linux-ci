@@ -28,8 +28,12 @@ int create_branch(struct ppc_inst *instr, const struct ppc_inst *addr,
 int create_cond_branch(struct ppc_inst *instr, const struct ppc_inst *addr,
 		       unsigned long target, int flags);
 int patch_branch(struct ppc_inst *addr, unsigned long target, int flags);
+int patch_branch_unlocked(struct ppc_inst *addr, unsigned long target, int flags);
 int patch_instruction(struct ppc_inst *addr, struct ppc_inst instr);
+int patch_instruction_unlocked(struct ppc_inst *addr, struct ppc_inst instr);
 int raw_patch_instruction(struct ppc_inst *addr, struct ppc_inst instr);
+unsigned long lock_patching(void);
+void unlock_patching(unsigned long flags);
 
 static inline unsigned long patch_site_addr(s32 *site)
 {
