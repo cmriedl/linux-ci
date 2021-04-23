@@ -28,6 +28,7 @@ static int __init early_init_dt_scan_epapr(unsigned long node,
 	const u32 *insts;
 	int len;
 	int i;
+	unsigned long flags;
 
 	insts = of_get_flat_dt_prop(node, "hcall-instructions", &len);
 	if (!insts)
@@ -36,13 +37,17 @@ static int __init early_init_dt_scan_epapr(unsigned long node,
 	if (len % 4 || len > (4 * 4))
 		return -1;
 
+	flags = lock_patching();
+
 	for (i = 0; i < (len / 4); i++) {
 		struct ppc_inst inst = ppc_inst(be32_to_cpu(insts[i]));
-		patch_instruction((struct ppc_inst *)(epapr_hypercall_start + i), inst);
+		patch_instruction_unlocked((struct ppc_inst *)(epapr_hypercall_start + i), inst);
 #if !defined(CONFIG_64BIT) || defined(CONFIG_PPC_BOOK3E_64)
-		patch_instruction((struct ppc_inst *)(epapr_ev_idle_start + i), inst);
+		patch_instruction_unlocked((struct ppc_inst *)(epapr_ev_idle_start + i), inst);
 #endif
 	}
+
+	unlock_patching(flags);
 
 #if !defined(CONFIG_64BIT) || defined(CONFIG_PPC_BOOK3E_64)
 	if (of_get_flat_dt_prop(node, "has-idle", NULL))

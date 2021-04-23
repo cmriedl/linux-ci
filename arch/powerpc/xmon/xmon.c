@@ -905,6 +905,9 @@ static void insert_bpts(void)
 	int i;
 	struct ppc_inst instr, instr2;
 	struct bpt *bp, *bp2;
+	unsigned long flags;
+
+	flags = lock_patching();
 
 	bp = bpts;
 	for (i = 0; i < NBPTS; ++i, ++bp) {
@@ -945,19 +948,21 @@ static void insert_bpts(void)
 			continue;
 		}
 
-		patch_instruction(bp->instr, instr);
-		patch_instruction(ppc_inst_next(bp->instr, &instr),
-				  ppc_inst(bpinstr));
+		patch_instruction_unlocked(bp->instr, instr);
+		patch_instruction_unlocked(ppc_inst_next(bp->instr, &instr),
+					   ppc_inst(bpinstr));
 		if (bp->enabled & BP_CIABR)
 			continue;
-		if (patch_instruction((struct ppc_inst *)bp->address,
-				      ppc_inst(bpinstr)) != 0) {
+		if (patch_instruction_unlocked((struct ppc_inst *)bp->address,
+						ppc_inst(bpinstr)) != 0) {
 			printf("Couldn't write instruction at %lx, "
 			       "disabling breakpoint there\n", bp->address);
 			bp->enabled &= ~BP_TRAP;
 			continue;
 		}
 	}
+
+	unlock_patching(flags);
 }
 
 static void insert_cpu_bpts(void)
@@ -984,6 +989,9 @@ static void remove_bpts(void)
 	int i;
 	struct bpt *bp;
 	struct ppc_inst instr;
+	unsigned long flags;
+
+	flags = lock_patching();
 
 	bp = bpts;
 	for (i = 0; i < NBPTS; ++i, ++bp) {
@@ -991,11 +999,13 @@ static void remove_bpts(void)
 			continue;
 		if (mread_instr(bp->address, &instr)
 		    && ppc_inst_equal(instr, ppc_inst(bpinstr))
-		    && patch_instruction(
+		    && patch_instruction_unlocked(
 			(struct ppc_inst *)bp->address, ppc_inst_read(bp->instr)) != 0)
 			printf("Couldn't remove breakpoint at %lx\n",
 			       bp->address);
 	}
+
+	unlock_patching(flags);
 }
 
 static void remove_cpu_bpts(void)

@@ -200,7 +200,7 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *p)
 	struct ppc_inst branch_op_callback, branch_emulate_step, temp;
 	kprobe_opcode_t *op_callback_addr, *emulate_step_addr, *buff;
 	long b_offset;
-	unsigned long nip, size;
+	unsigned long nip, size, flags;
 	int rc, i;
 
 	kprobe_ppc_optinsn_slots.insn_size = MAX_OPTINSN_SIZE;
@@ -237,12 +237,19 @@ int arch_prepare_optimized_kprobe(struct optimized_kprobe *op, struct kprobe *p)
 	/* We can optimize this via patch_instruction_window later */
 	size = (TMPL_END_IDX * sizeof(kprobe_opcode_t)) / sizeof(int);
 	pr_devel("Copying template to %p, size %lu\n", buff, size);
+
+	flags = lock_patching();
+
 	for (i = 0; i < size; i++) {
-		rc = patch_instruction((struct ppc_inst *)(buff + i),
-				       ppc_inst(*(optprobe_template_entry + i)));
-		if (rc < 0)
+		rc = patch_instruction_unlocked((struct ppc_inst *)(buff + i),
+						ppc_inst(*(optprobe_template_entry + i)));
+		if (rc < 0) {
+			unlock_patching(flags);
 			goto error;
+		}
 	}
+
+	unlock_patching(flags);
 
 	/*
 	 * Fixup the template with instructions to:
@@ -322,6 +329,9 @@ void arch_optimize_kprobes(struct list_head *oplist)
 	struct ppc_inst instr;
 	struct optimized_kprobe *op;
 	struct optimized_kprobe *tmp;
+	unsigned long flags;
+
+	flags = lock_patching();
 
 	list_for_each_entry_safe(op, tmp, oplist, list) {
 		/*
@@ -333,9 +343,11 @@ void arch_optimize_kprobes(struct list_head *oplist)
 		create_branch(&instr,
 			      (struct ppc_inst *)op->kp.addr,
 			      (unsigned long)op->optinsn.insn, 0);
-		patch_instruction((struct ppc_inst *)op->kp.addr, instr);
+		patch_instruction_unlocked((struct ppc_inst *)op->kp.addr, instr);
 		list_del_init(&op->list);
 	}
+
+	unlock_patching(flags);
 }
 
 void arch_unoptimize_kprobe(struct optimized_kprobe *op)
