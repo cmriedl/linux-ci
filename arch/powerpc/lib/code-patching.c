@@ -11,6 +11,8 @@
 #include <linux/cpuhotplug.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/sched/task.h>
+#include <linux/random.h>
 
 #include <asm/tlbflush.h>
 #include <asm/page.h>
@@ -19,6 +21,7 @@
 #include <asm/inst.h>
 #include <asm/mmu_context.h>
 #include <asm/debug.h>
+#include <asm/tlb.h>
 
 static int __patch_instruction(struct ppc_inst *exec_addr, struct ppc_inst instr,
 			       struct ppc_inst *patch_addr)
@@ -73,6 +76,8 @@ static inline void use_temporary_mm(struct temp_mm *temp_mm)
 	temp_mm->prev = current->active_mm;
 	switch_mm_irqs_off(temp_mm->prev, temp_mm->temp, current);
 
+	WARN_ON(!mm_is_thread_local(temp_mm->temp));
+
 	if (ppc_breakpoint_available()) {
 		struct arch_hw_breakpoint null_brk = {0};
 		int i = 0;
@@ -91,6 +96,17 @@ static inline void unuse_temporary_mm(struct temp_mm *temp_mm)
 
 	switch_mm_irqs_off(temp_mm->temp, temp_mm->prev, current);
 
+	/*
+	 * On book3s64 the active_cpus counter increments in
+	 * switch_mm_irqs_off(). With the Hash MMU this counter affects if TLB
+	 * flushes are local. We have to manually decrement that counter here
+	 * along with removing our current CPU from the mm's cpumask so that in
+	 * the future a different CPU can reuse the temporary mm and still rely
+	 * on local TLB flushes.
+	 */
+	dec_mm_active_cpus(temp_mm->temp);
+	cpumask_clear_cpu(smp_processor_id(), mm_cpumask(temp_mm->temp));
+
 	if (ppc_breakpoint_available()) {
 		int i = 0;
 
@@ -100,113 +116,142 @@ static inline void unuse_temporary_mm(struct temp_mm *temp_mm)
 	}
 }
 
-static DEFINE_PER_CPU(struct vm_struct *, text_poke_area);
+static struct mm_struct *patching_mm __ro_after_init;
+static unsigned long patching_addr __ro_after_init;
+
+void __init poking_init(void)
+{
+	spinlock_t *ptl; /* for protecting pte table */
+	pte_t *ptep;
+
+	/*
+	 * Some parts of the kernel (static keys for example) depend on
+	 * successful code patching. Code patching under STRICT_KERNEL_RWX
+	 * requires this setup - otherwise we cannot patch at all. We use
+	 * BUG_ON() here and later since an early failure is preferred to
+	 * buggy behavior and/or strange crashes later.
+	 */
+	patching_mm = copy_init_mm();
+	BUG_ON(!patching_mm);
+
+	/*
+	 * Choose a randomized, page-aligned address from the range:
+	 * [PAGE_SIZE, DEFAULT_MAP_WINDOW - PAGE_SIZE]
+	 * The lower address bound is PAGE_SIZE to avoid the zero-page.
+	 * The upper address bound is DEFAULT_MAP_WINDOW - PAGE_SIZE to stay
+	 * under DEFAULT_MAP_WINDOW in hash.
+	 */
+	patching_addr = PAGE_SIZE + ((get_random_long() & PAGE_MASK)
+			% (DEFAULT_MAP_WINDOW - 2 * PAGE_SIZE));
+
+	/*
+	 * PTE allocation uses GFP_KERNEL which means we need to pre-allocate
+	 * the PTE here. We cannot do the allocation during patching with IRQs
+	 * disabled (ie. "atomic" context).
+	 */
+	ptep = get_locked_pte(patching_mm, patching_addr, &ptl);
+	BUG_ON(!ptep);
+	pte_unmap_unlock(ptep, ptl);
+}
 
 #if IS_BUILTIN(CONFIG_LKDTM)
 unsigned long read_cpu_patching_addr(unsigned int cpu)
 {
-	return (unsigned long)(per_cpu(text_poke_area, cpu))->addr;
+	return patching_addr;
 }
 #endif
 
-static int text_area_cpu_up(unsigned int cpu)
+struct patch_mapping {
+	spinlock_t *ptl; /* for protecting pte table */
+	pte_t *ptep;
+	struct temp_mm temp_mm;
+};
+
+#ifdef CONFIG_PPC_BOOK3S_64
+
+static inline int hash_prefault_mapping(pgprot_t pgprot)
 {
-	struct vm_struct *area;
+	int err;
 
-	area = get_vm_area(PAGE_SIZE, VM_ALLOC);
-	if (!area) {
-		WARN_ONCE(1, "Failed to create text area for cpu %d\n",
-			cpu);
-		return -1;
-	}
-	this_cpu_write(text_poke_area, area);
+	if (radix_enabled())
+		return 0;
 
+	err = slb_allocate_user(patching_mm, patching_addr);
+	if (err)
+		pr_warn("map patch: failed to allocate slb entry\n");
+
+	err = hash_page_mm(patching_mm, patching_addr, pgprot_val(pgprot), 0,
+			   HPTE_USE_KERNEL_KEY);
+	if (err)
+		pr_warn("map patch: failed to insert hashed page\n");
+
+	/* See comment in switch_slb() in mm/book3s64/slb.c */
+	isync();
+
+	return err;
+}
+
+#else
+
+static inline int hash_prefault_mapping(pgprot_t pgprot)
+{
 	return 0;
 }
 
-static int text_area_cpu_down(unsigned int cpu)
-{
-	free_vm_area(this_cpu_read(text_poke_area));
-	return 0;
-}
-
-/*
- * Run as a late init call. This allows all the boot time patching to be done
- * simply by patching the code, and then we're called here prior to
- * mark_rodata_ro(), which happens after all init calls are run. Although
- * BUG_ON() is rude, in this case it should only happen if ENOMEM, and we judge
- * it as being preferable to a kernel that will crash later when someone tries
- * to use patch_instruction().
- */
-static int __init setup_text_poke_area(void)
-{
-	BUG_ON(!cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
-		"powerpc/text_poke:online", text_area_cpu_up,
-		text_area_cpu_down));
-
-	return 0;
-}
-late_initcall(setup_text_poke_area);
+#endif /* CONFIG_PPC_BOOK3S_64 */
 
 /*
  * This can be called for kernel text or a module.
  */
-static int map_patch_area(void *addr, unsigned long text_poke_addr)
+static int map_patch(const void *addr, struct patch_mapping *patch_mapping)
 {
-	unsigned long pfn;
-	int err;
+	struct page *page;
+	pte_t pte;
+	pgprot_t pgprot;
 
 	if (is_vmalloc_or_module_addr(addr))
-		pfn = vmalloc_to_pfn(addr);
+		page = vmalloc_to_page(addr);
 	else
-		pfn = __pa_symbol(addr) >> PAGE_SHIFT;
+		page = virt_to_page(addr);
 
-	err = map_kernel_page(text_poke_addr, (pfn << PAGE_SHIFT), PAGE_KERNEL);
+	if (radix_enabled())
+		pgprot = PAGE_KERNEL;
+	else
+		pgprot = PAGE_SHARED;
 
-	pr_devel("Mapped addr %lx with pfn %lx:%d\n", text_poke_addr, pfn, err);
-	if (err)
+	patch_mapping->ptep = get_locked_pte(patching_mm, patching_addr,
+					     &patch_mapping->ptl);
+	if (unlikely(!patch_mapping->ptep)) {
+		pr_warn("map patch: failed to allocate pte for patching\n");
 		return -1;
+	}
 
-	return 0;
-}
+	pte = mk_pte(page, pgprot);
+	pte = pte_mkdirty(pte);
+	set_pte_at(patching_mm, patching_addr, patch_mapping->ptep, pte);
 
-static inline int unmap_patch_area(unsigned long addr)
-{
-	pte_t *ptep;
-	pmd_t *pmdp;
-	pud_t *pudp;
-	p4d_t *p4dp;
-	pgd_t *pgdp;
-
-	pgdp = pgd_offset_k(addr);
-	if (unlikely(!pgdp))
-		return -EINVAL;
-
-	p4dp = p4d_offset(pgdp, addr);
-	if (unlikely(!p4dp))
-		return -EINVAL;
-
-	pudp = pud_offset(p4dp, addr);
-	if (unlikely(!pudp))
-		return -EINVAL;
-
-	pmdp = pmd_offset(pudp, addr);
-	if (unlikely(!pmdp))
-		return -EINVAL;
-
-	ptep = pte_offset_kernel(pmdp, addr);
-	if (unlikely(!ptep))
-		return -EINVAL;
-
-	pr_devel("clearing mm %p, pte %p, addr %lx\n", &init_mm, ptep, addr);
+	init_temp_mm(&patch_mapping->temp_mm, patching_mm);
+	use_temporary_mm(&patch_mapping->temp_mm);
 
 	/*
-	 * In hash, pte_clear flushes the tlb, in radix, we have to
+	 * On Hash we have to manually insert the SLB entry and hashed page to
+	 * prevent taking faults on the patching_addr during patching.
 	 */
-	pte_clear(&init_mm, addr, ptep);
-	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
+	return(hash_prefault_mapping(pgprot));
+}
 
-	return 0;
+static void unmap_patch(struct patch_mapping *patch_mapping)
+{
+	/* In hash pte_clear() flushes the TLB */
+	pte_clear(patching_mm, patching_addr, patch_mapping->ptep);
+
+	/* In radix we have to explicitly flush the TLB (no-op in hash) */
+	local_flush_tlb_mm(patching_mm);
+
+	pte_unmap_unlock(patch_mapping->ptep, patch_mapping->ptl);
+
+	/* In hash switch_mm_irqs_off() invalidates the SLB */
+	unuse_temporary_mm(&patch_mapping->temp_mm);
 }
 
 static int do_patch_instruction(struct ppc_inst *addr, struct ppc_inst instr)
@@ -214,32 +259,33 @@ static int do_patch_instruction(struct ppc_inst *addr, struct ppc_inst instr)
 	int err;
 	struct ppc_inst *patch_addr = NULL;
 	unsigned long flags;
-	unsigned long text_poke_addr;
-	unsigned long kaddr = (unsigned long)addr;
+	struct patch_mapping patch_mapping;
 
 	/*
-	 * During early early boot patch_instruction is called
-	 * when text_poke_area is not ready, but we still need
-	 * to allow patching. We just do the plain old patching
+	 * The patching_mm is initialized before calling mark_rodata_ro. Prior
+	 * to this, patch_instruction is called when we don't have (and don't
+	 * need) the patching_mm so just do plain old patching.
 	 */
-	if (!this_cpu_read(text_poke_area))
+	if (!patching_mm)
 		return raw_patch_instruction(addr, instr);
 
 	local_irq_save(flags);
 
-	text_poke_addr = (unsigned long)__this_cpu_read(text_poke_area)->addr;
-	if (map_patch_area(addr, text_poke_addr)) {
-		err = -1;
-		goto out;
-	}
-
-	patch_addr = (struct ppc_inst *)(text_poke_addr + (kaddr & ~PAGE_MASK));
-
-	__patch_instruction(addr, instr, patch_addr);
-
-	err = unmap_patch_area(text_poke_addr);
+	err = map_patch(addr, &patch_mapping);
 	if (err)
-		pr_warn("failed to unmap %lx\n", text_poke_addr);
+		goto out;
+
+	patch_addr = (struct ppc_inst *)(patching_addr | offset_in_page(addr));
+
+	if (!IS_ENABLED(CONFIG_PPC_BOOK3S_64))
+		allow_read_write_user(patch_addr, patch_addr, ppc_inst_len(instr));
+	err = __patch_instruction(addr, instr, patch_addr);
+	if (!IS_ENABLED(CONFIG_PPC_BOOK3S_64))
+		prevent_read_write_user(patch_addr, patch_addr, ppc_inst_len(instr));
+
+	unmap_patch(&patch_mapping);
+
+	WARN_ON(!ppc_inst_equal(ppc_inst_read(addr), instr));
 
 out:
 	local_irq_restore(flags);
