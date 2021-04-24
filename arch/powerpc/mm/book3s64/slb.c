@@ -29,8 +29,6 @@
 #include "internal.h"
 
 
-static long slb_allocate_user(struct mm_struct *mm, unsigned long ea);
-
 bool stress_slb_enabled __initdata;
 
 static int __init parse_stress_slb(char *p)
@@ -791,7 +789,7 @@ static long slb_allocate_kernel(unsigned long ea, unsigned long id)
 	return slb_insert_entry(ea, context, flags, ssize, true);
 }
 
-static long slb_allocate_user(struct mm_struct *mm, unsigned long ea)
+long slb_allocate_user(struct mm_struct *mm, unsigned long ea)
 {
 	unsigned long context;
 	unsigned long flags;
